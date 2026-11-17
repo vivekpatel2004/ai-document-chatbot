@@ -1,0 +1,76 @@
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    container_name: document-chatbot-backend
+
+    ports:
+      - "${BACKEND_HOST_PORT:-8000}:${BACKEND_CONTAINER_PORT:-8000}"
+
+    env_file:
+      - ./backend/.env
+
+    environment:
+      PORT: ${BACKEND_CONTAINER_PORT:-8000}
+      DB_PATH: /app/database/chatbot.db
+
+    volumes:
+      - ./uploads:/uploads
+      - ./backend/database:/app/database
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:'+os.getenv('PORT','8000')+'/api/health',timeout=5)"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+
+    container_name: document-chatbot-frontend
+
+    ports:
+      - "${FRONTEND_HOST_PORT:-80}:${FRONTEND_CONTAINER_PORT:-80}"
+
+    environment:
+      PORT: ${FRONTEND_CONTAINER_PORT:-80}
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:${FRONTEND_CONTAINER_PORT:-80}/health"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  default:
+    name: document-chatbot-network
