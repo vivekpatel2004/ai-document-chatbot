@@ -72,7 +72,7 @@ def _get_document_context(document_ids: list[str], query: str = "", owner_id: st
         relevant_chunks = chunks[:30]
 
     context = create_rag_prompt(
-        query=query or "Analyze the selected documents.",
+        question=query or "Analyze the selected documents.",
         retrieved_chunks=relevant_chunks,
     )
 
