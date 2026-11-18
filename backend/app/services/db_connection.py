@@ -153,7 +153,7 @@ def execute_transaction_batch(connection, statements, *, commit: bool = True):
                 output.append(getattr(cursor, "rowcount", 0))
         return output
 
-    from turso_serverless.protocol import build_batch_step, decode_value
+    from turso_serverless.protocol import ProtocolError, build_batch_step, decode_value
 
     steps = [build_batch_step("BEGIN", want_rows=False)]
     for index, (sql, params, want_rows) in enumerate(normalized_statements, start=1):
@@ -183,10 +183,29 @@ def execute_transaction_batch(connection, statements, *, commit: bool = True):
     ))
 
     with measure_stage("database_pipeline"):
-        record_pipeline(len(statements))
-        results = session.execute_pipeline([
-            {"type": "batch", "batch": {"steps": steps}}
-        ])
+        for attempt in range(2):
+            record_pipeline(len(statements))
+            try:
+                results = session.execute_pipeline([
+                    {"type": "batch", "batch": {"steps": steps}}
+                ])
+                break
+            except ProtocolError as exc:
+                message = str(exc).casefold()
+                expired_stream = (
+                    "404" in message
+                    and "stream not found" in message
+                )
+                if attempt or not expired_stream:
+                    raise
+
+                # Session._post() resets its baton on every HTTP error. A
+                # stream-not-found response means this pipeline was rejected
+                # before its statements ran; its prior transaction no longer
+                # exists. Re-establish the connection-scoped FK setting on the
+                # new stream, then retry the complete atomic batch once.
+                with measure_stage("database_stream_recovery"):
+                    driver_connection.execute("PRAGMA foreign_keys = ON")
 
     if len(results) != 1:
         raise RuntimeError("Turso pipeline returned an unexpected result count.")

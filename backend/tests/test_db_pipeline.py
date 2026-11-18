@@ -7,17 +7,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from turso_serverless.protocol import ProtocolError
 from app.services.db_connection import execute_transaction_batch
 from app.services import database
 
 
 class FakeSession:
-    def __init__(self, failure_step=None):
+    def __init__(self, failure_step=None, expire_first=False):
         self.failure_step = failure_step
+        self.expire_first = expire_first
         self.requests = []
+        self.executed_batches = 0
 
     def execute_pipeline(self, requests):
         self.requests.append(requests)
+        if self.expire_first and len(self.requests) == 1:
+            # Match the exact ProtocolError text raised by the installed
+            # turso-serverless 0.1.0 Session._post() for an expired baton.
+            raise ProtocolError("HTTP status 404: stream not found")
+        self.executed_batches += 1
         batch = requests[0]["batch"]
         count = len(batch["steps"])
         errors = [None] * count
@@ -73,6 +81,59 @@ class TursoPipelineTests(unittest.TestCase):
 
         self.assertEqual(result[0]["rows"], [("doc-a",)])
         self.assertEqual(len(session.requests), 1)
+
+    def test_expired_stream_reapplies_foreign_keys_and_retries_atomically(self):
+        session = FakeSession(expire_first=True)
+        pragmas = []
+        connection = SimpleNamespace(
+            _session=session,
+            execute=lambda sql: pragmas.append(sql),
+        )
+
+        counts = execute_transaction_batch(connection, [
+            ("INSERT INTO chunks(id) VALUES (?)", ("chunk-a",)),
+        ])
+
+        self.assertEqual(counts, [1])
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(session.executed_batches, 1)
+        self.assertEqual(pragmas, ["PRAGMA foreign_keys = ON"])
+
+    def test_chunk_upload_pipeline_recovers_expired_request_stream(self):
+        session = FakeSession(expire_first=True)
+        pragmas = []
+
+        class FakeTursoConnection:
+            def __init__(self):
+                self._session = session
+
+            def execute(self, sql, _params=()):
+                pragmas.append(sql)
+                return SimpleNamespace(rowcount=0)
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                return None
+
+        with patch.dict(os.environ, {"DATABASE_PROVIDER": "turso"}), patch(
+            "app.services.db_connection._open_connection",
+            return_value=FakeTursoConnection(),
+        ):
+            database.add_chunks(
+                "doc-a",
+                [{"chunk_id": "chunk-a", "chunk_index": 0, "content": "text"}],
+                [b"embedding"],
+                document_status=(1, 1),
+            )
+
+        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(session.executed_batches, 1)
+        self.assertEqual(pragmas, ["PRAGMA foreign_keys = ON"])
 
     def test_failed_statement_raises_and_batch_includes_conditional_rollback(self):
         session = FakeSession(failure_step=1)
