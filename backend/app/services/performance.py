@@ -20,6 +20,8 @@ class RequestPerformance:
         self.started = time.perf_counter()
         self.stages_ms: dict[str, float] = {}
         self.database_operations = 0
+        self.database_statement_counts: dict[str, int] = {}
+        self.database_statement_max_ms: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def add(self, name: str, elapsed_ms: float) -> None:
@@ -27,6 +29,15 @@ class RequestPerformance:
             self.stages_ms[name] = self.stages_ms.get(name, 0.0) + elapsed_ms
             if name == "database":
                 self.database_operations += 1
+            elif name.startswith("db_statement:"):
+                statement = name.partition(":")[2]
+                self.database_statement_counts[statement] = (
+                    self.database_statement_counts.get(statement, 0) + 1
+                )
+                self.database_statement_max_ms[statement] = max(
+                    self.database_statement_max_ms.get(statement, 0.0),
+                    elapsed_ms,
+                )
 
 
 @contextmanager
@@ -65,13 +76,22 @@ class PerformanceLoggingMiddleware:
             await self.app(scope, receive, send)
         finally:
             total_ms = (time.perf_counter() - trace.started) * 1000
+            statement_metrics = {
+                label: {
+                    "count": count,
+                    "total_ms": round(trace.stages_ms.get(f"db_statement:{label}", 0.0), 1),
+                    "max_ms": round(trace.database_statement_max_ms.get(label, 0.0), 1),
+                }
+                for label, count in trace.database_statement_counts.items()
+            }
             logger.info(
                 "request_timing method=%s path=%s total_ms=%.1f "
-                "database_operations=%d stages_ms=%s",
+                "database_operations=%d database_statement_metrics=%s stages_ms=%s",
                 trace.method,
                 trace.path,
                 total_ms,
                 trace.database_operations,
+                statement_metrics,
                 {key: round(value, 1) for key, value in trace.stages_ms.items()},
             )
             _current_trace.reset(token)

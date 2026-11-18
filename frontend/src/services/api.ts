@@ -264,6 +264,20 @@ export async function streamChat(
   });
 
   if (response.status === 404 || response.status === 405) {
+    let detail = '';
+    try {
+      const data = await response.clone().json();
+      detail = typeof data?.detail === 'string' ? data.detail : '';
+    } catch {
+      // A proxy or older server may return a non-JSON missing-route response.
+    }
+
+    const genericRouteError =
+      (response.status === 404 && detail.toLowerCase() === 'not found') ||
+      (response.status === 405 && detail.toLowerCase() === 'method not allowed');
+    if (detail && !genericRouteError) {
+      throw new Error(detail);
+    }
     throw new StreamUnavailableError();
   }
 

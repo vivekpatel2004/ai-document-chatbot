@@ -273,15 +273,10 @@ async def upload_documents(
                     document_id,
                     chunks,
                     [embedding.tobytes() for embedding in embeddings],
-                )
-
-                # Mark document as processed.
-                await run_in_threadpool(
-                    database.update_document_status,
-                    document_id=document_id,
-                    status="processed",
-                    total_pages=processed["total_pages"],
-                    total_chunks=processed["total_chunks"],
+                    document_status=(
+                        processed["total_pages"],
+                        processed["total_chunks"],
+                    ),
                 )
 
                 uploaded_documents.append({

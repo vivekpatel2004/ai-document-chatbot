@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+from app.services.performance import measure_stage
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env", override=False)
@@ -74,6 +75,11 @@ def _sqlite_path() -> Path:
 
 
 def _open_connection():
+    with measure_stage("database_connect"):
+        return _create_connection()
+
+
+def _create_connection():
     """Create and configure a provider connection."""
     provider = _provider()
     if provider == "sqlite":
@@ -192,10 +198,12 @@ def get_connection():
         )
         try:
             yield connection
-            connection.commit()
+            with measure_stage("database_commit"):
+                connection.commit()
         except Exception:
             try:
-                connection.rollback()
+                with measure_stage("database_rollback"):
+                    connection.rollback()
             except Exception:
                 pass
             raise

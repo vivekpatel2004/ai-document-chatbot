@@ -21,9 +21,48 @@ def get_db():
     def measured_connection():
         with measure_stage("database"):
             with get_connection() as connection:
-                yield connection
+                yield _TimedConnection(connection)
 
     return measured_connection()
+
+
+def _statement_label(query: str) -> str:
+    """Return a low-cardinality SQL label without logging SQL or parameters."""
+    operation_match = re.match(r"\s*([A-Za-z]+)", query)
+    operation = operation_match.group(1).lower() if operation_match else "other"
+    tables = []
+    for table in re.findall(
+        r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE|ON)\s+[\"`]?([A-Za-z_][A-Za-z0-9_]*)",
+        query,
+        re.IGNORECASE,
+    ):
+        name = table.lower()
+        if name not in tables and name not in {"if", "not", "exists", "set"}:
+            tables.append(name)
+    table_label = "_".join(tables[:3]) or "unknown"
+    return f"{operation}_{table_label}"
+
+
+class _TimedConnection:
+    """Transparent DB-API proxy that times each SQL statement, including direct calls."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, query, parameters=()):
+        with measure_stage(f"db_statement:{_statement_label(query)}"):
+            return self._connection.execute(query, parameters)
+
+    def executemany(self, query, parameters):
+        with measure_stage(f"db_statement:{_statement_label(query)}"):
+            return self._connection.executemany(query, parameters)
+
+    def executescript(self, query):
+        with measure_stage(f"db_statement:{_statement_label(query)}"):
+            return self._connection.executescript(query)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 _DOCUMENT_CACHE_TTL_SECONDS = 10.0
@@ -341,20 +380,37 @@ def create_document(
     owner_id: str | None = None,
     content_hash: str | None = None,
 ):
-    execute("""
-        INSERT INTO documents (
-            id, conversation_id, owner_id, content_hash, filename,
-            file_type, file_size, file_path
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        document_id, conversation_id, owner_id, content_hash, filename,
-        file_type, file_size, file_path,
-    ))
-    _invalidate_document_cache(owner_id, document_id)
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO documents (
+                id, conversation_id, owner_id, content_hash, filename,
+                file_type, file_size, file_path
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            document_id, conversation_id, owner_id, content_hash, filename,
+            file_type, file_size, file_path,
+        ))
 
-    if conversation_id and owner_id:
-        attach_document_to_conversation(document_id, conversation_id, owner_id)
+        if conversation_id and owner_id:
+            valid_row = conn.execute("""
+                SELECT d.id FROM documents d
+                JOIN conversations c ON c.id = ? AND c.owner_id = ?
+                WHERE d.id = ? AND d.owner_id = ?
+            """, (conversation_id, owner_id, document_id, owner_id)).fetchone()
+            if valid_row:
+                conn.execute("""
+                    INSERT OR IGNORE INTO conversation_documents
+                        (conversation_id, document_id, owner_id)
+                    VALUES (?, ?, ?)
+                """, (conversation_id, document_id, owner_id))
+                conn.execute("""
+                    UPDATE documents
+                    SET conversation_id = COALESCE(conversation_id, ?)
+                    WHERE id = ? AND owner_id = ?
+                """, (conversation_id, document_id, owner_id))
+
+    _invalidate_document_cache(owner_id, document_id)
 
 
 def find_document_by_hash(owner_id: str, content_hash: str, file_size: int):
@@ -575,12 +631,19 @@ def add_chunk(
     ))
 
 
-def add_chunks(document_id: str, chunks: list[dict], embeddings: list[bytes]) -> None:
+def add_chunks(
+    document_id: str,
+    chunks: list[dict],
+    embeddings: list[bytes],
+    document_status: tuple[int, int] | None = None,
+) -> None:
     """Persist chunk metadata and embeddings in bounded multi-row inserts.
 
-    A single transaction is used for the whole document. Multi-value INSERTs
-    are intentional: the Turso DB-API executemany implementation sends one
-    request per row, while each execute here sends at most 50 rows at once.
+    A single transaction is used for the whole document. When supplied,
+    document_status marks the upload processed atomically with its chunks.
+    Multi-value INSERTs are intentional: the Turso DB-API executemany
+    implementation sends one request per row, while each execute here sends
+    at most 50 rows at once.
     """
     if len(chunks) != len(embeddings):
         raise ValueError("Chunk and embedding counts must match.")
@@ -607,6 +670,17 @@ def add_chunks(document_id: str, chunks: list[dict], embeddings: list[bytes]) ->
                     embedding_model
                 ) VALUES {values}
             """, tuple(params))
+        if document_status is not None:
+            total_pages, total_chunks = document_status
+            updated = conn.execute("""
+                UPDATE documents
+                SET status = 'processed', total_pages = ?, total_chunks = ?
+                WHERE id = ?
+            """, (total_pages, total_chunks, document_id))
+            if updated.rowcount != 1:
+                raise ValueError("Document record was not available to mark as processed.")
+    if document_status is not None:
+        _invalidate_document_cache(document_id=document_id)
 
 
 def get_embedding_migration_counts() -> dict[str, int]:
@@ -706,24 +780,25 @@ def add_message(
     content: str,
     sources: list[dict] | None = None,
 ):
-    execute("""
-        INSERT INTO messages (
-            id, conversation_id, role, content, sources
-        )
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        message_id,
-        conversation_id,
-        role,
-        content,
-        json.dumps(sources or []),
-    ))
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO messages (
+                id, conversation_id, role, content, sources
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            message_id,
+            conversation_id,
+            role,
+            content,
+            json.dumps(sources or []),
+        ))
 
-    execute("""
-        UPDATE conversations
-        SET updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (conversation_id,))
+        conn.execute("""
+            UPDATE conversations
+            SET updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (conversation_id,))
 
 
 def get_messages(conversation_id: str):
