@@ -24,11 +24,6 @@ EMBEDDING_BATCH_SIZE = 64  # Gemini batch requests support up to 100 inputs.
 EMBEDDING_TIMEOUT_SECONDS = 30.0
 EMBEDDING_MAX_RETRIES = 4
 EMBEDDING_REQUESTS_PER_MINUTE = 60
-GEMINI_EMBEDDING_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{DEFAULT_EMBEDDING_MODEL}:batchEmbedContents"
-)
-
 DEFAULT_TOP_K = 5
 DEFAULT_SCORE_THRESHOLD = 0.05
 
@@ -55,9 +50,11 @@ def _get_embedding_api_key() -> str:
     return api_key
 
 
-def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
-    if response is not None:
-        retry_after = response.headers.get("Retry-After")
+def _retry_delay(error: Exception | None, attempt: int) -> float:
+    if error is not None:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None) or getattr(error, "headers", {})
+        retry_after = headers.get("Retry-After") if headers else None
         if retry_after:
             try:
                 return min(max(float(retry_after), 0.0), 30.0)
@@ -102,55 +99,58 @@ def _wait_for_rate_capacity(request_count: int) -> None:
 
 
 def _request_embedding_batch(
-    texts: Sequence[str], task_type: str, client: httpx.Client,
+    texts: Sequence[str], task_type: str, client: Any,
 ) -> list[list[float]]:
-    api_key = _get_embedding_api_key()
-    payload = {
-        "requests": [
-            {
-                "model": f"models/{DEFAULT_EMBEDDING_MODEL}",
-                "content": {"parts": [{"text": text}]},
-                "embedContentConfig": {
-                    "taskType": task_type,
-                    "outputDimensionality": EMBEDDING_DIMENSION,
-                },
-            }
-            for text in texts
-        ]
-    }
-    headers = {"x-goog-api-key": api_key}
-    response = None
+    from google.genai import types
+
     for attempt in range(EMBEDDING_MAX_RETRIES + 1):
         try:
             _wait_for_rate_capacity(len(texts))
             with _embedding_request_gate:
-                response = client.post(GEMINI_EMBEDDING_URL, headers=headers, json=payload)
-            if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
-                if attempt < EMBEDDING_MAX_RETRIES:
-                    delay = _retry_delay(response, attempt)
-                    logger.warning("Gemini embeddings returned HTTP %s; retrying in %.1fs.", response.status_code, delay)
-                    time.sleep(delay)
-                    continue
-            response.raise_for_status()
-            data = response.json()
-            results = data.get("embeddings")
+                response = client.models.embed_content(
+                    model=DEFAULT_EMBEDDING_MODEL,
+                    contents=list(texts),
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=EMBEDDING_DIMENSION,
+                    ),
+                )
+            results = getattr(response, "embeddings", None)
+            if results is None and isinstance(response, dict):
+                results = response.get("embeddings")
             if not isinstance(results, list) or len(results) != len(texts):
                 raise ValueError("Gemini returned an unexpected number of embeddings.")
             vectors = []
             for item in results:
-                values = item.get("values") if isinstance(item, dict) else None
+                values = getattr(item, "values", None)
+                if values is None and isinstance(item, dict):
+                    values = item.get("values")
                 if not isinstance(values, list) or len(values) != EMBEDDING_DIMENSION:
                     raise ValueError(f"Gemini embedding must have {EMBEDDING_DIMENSION} dimensions.")
                 vectors.append(values)
             return vectors
-        except httpx.RequestError:
-            if attempt >= EMBEDDING_MAX_RETRIES:
+        except Exception as exc:
+            status_code = getattr(exc, "code", None)
+            response = getattr(exc, "response", None)
+            status_code = (
+                status_code
+                or getattr(exc, "status_code", None)
+                or getattr(response, "status_code", None)
+            )
+            error_name = type(exc).__name__.casefold()
+            retryable = (
+                isinstance(exc, (httpx.RequestError, TimeoutError, ConnectionError, OSError))
+                or "timeout" in error_name
+                or "connection" in error_name
+                or status_code in {
+                408, 425, 429, 500, 502, 503, 504,
+                }
+            )
+            if not retryable or attempt >= EMBEDDING_MAX_RETRIES:
                 raise
-            delay = _retry_delay(None, attempt)
-            logger.warning("Gemini embedding request failed; retrying in %.1fs.", delay)
+            delay = _retry_delay(exc, attempt)
+            logger.warning("Gemini embedding request failed (HTTP %s); retrying in %.1fs.", status_code or "network", delay)
             time.sleep(delay)
-    if response is not None:
-        response.raise_for_status()
     raise RuntimeError("Gemini embedding request failed after retries.")
 
 
@@ -187,10 +187,22 @@ def generate_embeddings(
     batch_size = min(batch_size, requests_per_minute)
 
     vectors: list[list[float]] = []
-    with httpx.Client(timeout=timeout) as client:
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(
+        api_key=_get_embedding_api_key(),
+        http_options=types.HttpOptions(
+            timeout=int(timeout * 1000),
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    try:
         for start in range(0, len(cleaned_texts), batch_size):
             batch = cleaned_texts[start:start + batch_size]
             vectors.extend(_request_embedding_batch(batch, task_type, client))
+    finally:
+        client.close()
 
     embeddings = np.asarray(vectors, dtype=np.float32)
 

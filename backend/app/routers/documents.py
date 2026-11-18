@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import hashlib
 import uuid
@@ -41,6 +42,60 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _is_retryable_cleanup_error(error: Exception) -> bool:
+    """Turso can expire a request stream; a new statement can safely retry."""
+    message = str(error).casefold()
+    return "stream not found" in message and "404" in message
+
+
+async def _delete_failed_upload_record(document_id: str, owner_id: str) -> bool:
+    """Retry the idempotent delete after Turso's expired-stream 404 response."""
+    for attempt in range(3):
+        try:
+            await run_in_threadpool(database.delete_document, document_id, owner_id)
+            return True
+        except Exception as exc:
+            if not _is_retryable_cleanup_error(exc) or attempt == 2:
+                logger.exception(
+                    "Failed to remove incomplete document record %s; it remains for cleanup retry.",
+                    document_id,
+                )
+                return False
+            delay = 0.2 * (2 ** attempt)
+            logger.warning(
+                "Turso cleanup stream expired for incomplete document %s; retrying in %.1fs.",
+                document_id,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    return False
+
+
+async def _delete_failed_upload_object(storage_locator: str) -> bool:
+    """Retry idempotent object deletion before removing its recovery record."""
+    for attempt in range(3):
+        try:
+            storage = storage_for_locator(storage_locator)
+            await run_in_threadpool(storage.delete, storage_locator)
+            return True
+        except Exception:
+            if attempt == 2:
+                logger.exception(
+                    "Failed to clean up incomplete upload object %s; keeping its database record for retry.",
+                    storage_locator,
+                )
+                return False
+            delay = 0.2 * (2 ** attempt)
+            logger.warning(
+                "Incomplete upload object cleanup failed; retrying in %.1fs.",
+                delay,
+                exc_info=True,
+            )
+            await asyncio.sleep(delay)
+    return False
+
+
 async def cleanup_failed_upload(
     document_id: str,
     storage_locator: str | None,
@@ -48,20 +103,12 @@ async def cleanup_failed_upload(
 ) -> None:
     """Remove incomplete document records and uploaded files."""
 
-    if storage_locator:
-        try:
-            storage = storage_for_locator(storage_locator)
-            await run_in_threadpool(storage.delete, storage_locator)
-        except Exception:
-            logger.exception("Failed to clean up an incomplete document upload.")
-            # Keep the processing row as a recovery reference if the private
-            # object could not be removed.
-            return
+    if storage_locator and not await _delete_failed_upload_object(storage_locator):
+        # Keep the processing row as a recovery reference if the private
+        # object could not be removed.
+        return
 
-    try:
-        await run_in_threadpool(database.delete_document, document_id, owner_id)
-    except Exception:
-        logger.exception("Failed to remove an incomplete document record.")
+    await _delete_failed_upload_record(document_id, owner_id)
 
 
 @router.post(

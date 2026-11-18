@@ -1,5 +1,7 @@
 """RAG deduplication, scope, citation, and fallback-cache checks."""
 import unittest
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -8,6 +10,35 @@ from app.services import rag_service
 
 
 class RAGOptimizationTests(unittest.TestCase):
+    def _sdk_modules(self, client):
+        class EmbedContentConfig:
+            def __init__(self, *, task_type=None, output_dimensionality=None):
+                self.task_type = task_type
+                self.output_dimensionality = output_dimensionality
+
+        class HttpOptions:
+            def __init__(self, *, timeout, retry_options):
+                self.timeout = timeout
+                self.retry_options = retry_options
+
+        class HttpRetryOptions:
+            def __init__(self, *, attempts):
+                self.attempts = attempts
+
+        genai_module = ModuleType("google.genai")
+        genai_module.types = SimpleNamespace(
+            EmbedContentConfig=EmbedContentConfig,
+            HttpOptions=HttpOptions,
+            HttpRetryOptions=HttpRetryOptions,
+        )
+        def create_client(**kwargs):
+            client.client_options = kwargs
+            return client
+        genai_module.Client = create_client
+        google_module = ModuleType("google")
+        google_module.genai = genai_module
+        return {"google": google_module, "google.genai": genai_module}
+
     def test_retrieval_deduplicates_same_document_text_and_preserves_citation(self):
         vector = np.asarray([1.0, 0.0], dtype=np.float32)
         chunks = [
@@ -70,51 +101,81 @@ class RAGOptimizationTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
 
     def test_gemini_request_uses_retrieval_task_dimension_and_normalization(self):
-        class FakeResponse:
-            status_code = 200
-
-            @staticmethod
-            def json():
-                return {"embeddings": [{"values": [3.0] + [4.0] + [0.0] * 766}]}
-
-            @staticmethod
-            def raise_for_status():
-                return None
-
         class FakeClient:
-            payload = None
-            headers = None
+            def __init__(self):
+                self.requests = []
+                self.closed = False
+                self.models = SimpleNamespace(embed_content=self.embed_content)
 
-            def __enter__(self):
-                return self
+            def embed_content(self, **kwargs):
+                self.requests.append(kwargs)
+                return SimpleNamespace(embeddings=[SimpleNamespace(values=[3.0, 4.0] + [0.0] * 766)])
 
-            def __exit__(self, *_args):
-                return None
-
-            def post(self, url, headers, json):
-                self.payload = json
-                self.headers = headers
-                return FakeResponse()
+            def close(self):
+                self.closed = True
 
         client = FakeClient()
-        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True), patch.object(
-            rag_service.httpx, "Client", return_value=client
+        with patch.dict("os.environ", {
+            "GEMINI_API_KEY": "test-key",
+            "GEMINI_EMBEDDING_TIMEOUT_SECONDS": "7",
+        }, clear=True), patch.dict(
+            sys.modules, self._sdk_modules(client)
         ):
-            vector = rag_service.generate_embeddings(["passage"])[0]
-        request = client.payload["requests"][0]
-        self.assertEqual(client.headers["x-goog-api-key"], "test-key")
-        self.assertEqual(request["model"], "models/gemini-embedding-001")
-        self.assertEqual(request["embedContentConfig"]["taskType"], "RETRIEVAL_DOCUMENT")
-        self.assertEqual(request["embedContentConfig"]["outputDimensionality"], 768)
+            vectors = rag_service.generate_embeddings(["passage"])
+            query = rag_service.create_embedding("question")
+        document_request, query_request = client.requests
+        self.assertEqual(document_request["model"], "gemini-embedding-001")
+        self.assertEqual(document_request["contents"], ["passage"])
+        self.assertEqual(document_request["config"].task_type, "RETRIEVAL_DOCUMENT")
+        self.assertEqual(document_request["config"].output_dimensionality, 768)
+        self.assertEqual(query_request["config"].task_type, "RETRIEVAL_QUERY")
+        self.assertEqual(query_request["config"].output_dimensionality, 768)
+        self.assertEqual(client.client_options["api_key"], "test-key")
+        self.assertEqual(client.client_options["http_options"].timeout, 7000)
+        self.assertEqual(client.client_options["http_options"].retry_options.attempts, 1)
+        self.assertEqual(vectors.shape, (1, 768))
+        self.assertEqual(query.shape, (768,))
+        vector = vectors[0]
         self.assertAlmostEqual(float(np.linalg.norm(vector)), 1.0, places=6)
-        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True), patch.object(
-            rag_service.httpx, "Client", return_value=client
+        self.assertTrue(client.closed)
+
+    def test_wrong_sdk_vector_dimension_is_rejected_without_truncation(self):
+        class FakeClient:
+            models = SimpleNamespace(embed_content=lambda **_kwargs: SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[1.0] + [0.0] * 3071)]
+            ))
+            close = lambda _self: None
+
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True), patch.dict(
+            sys.modules, self._sdk_modules(FakeClient())
         ):
-            rag_service.create_embedding("question")
-        self.assertEqual(
-            client.payload["requests"][0]["embedContentConfig"]["taskType"],
-            "RETRIEVAL_QUERY",
-        )
+            with self.assertRaisesRegex(ValueError, "must have 768 dimensions"):
+                rag_service.generate_embeddings(["passage"])
+
+    def test_non_retryable_sdk_api_error_is_propagated(self):
+        class BadRequest(Exception):
+            code = 400
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+                self.models = SimpleNamespace(embed_content=self.embed_content)
+
+            def embed_content(self, **_kwargs):
+                self.calls += 1
+                raise BadRequest("invalid embedding request")
+
+            def close(self):
+                pass
+
+        client = FakeClient()
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True), patch.dict(
+            sys.modules, self._sdk_modules(client)
+        ), patch.object(rag_service.time, "sleep") as sleep:
+            with self.assertRaisesRegex(BadRequest, "invalid embedding request"):
+                rag_service.generate_embeddings(["passage"])
+        self.assertEqual(client.calls, 1)
+        sleep.assert_not_called()
 
     def test_rate_limiter_counts_texts_and_retry_after_is_honored(self):
         rag_service._embedding_rate_events.clear()
@@ -126,36 +187,29 @@ class RAGOptimizationTests(unittest.TestCase):
         sleep.assert_called_once_with(60.0)
         rag_service._embedding_rate_events.clear()
 
-        class FakeResponse:
-            def __init__(self, status_code):
-                self.status_code = status_code
-                self.headers = {"Retry-After": "0"}
-
-            @staticmethod
-            def json():
-                return {"embeddings": [{"values": [1.0] + [0.0] * 767}]}
-
-            def raise_for_status(self):
-                if self.status_code != 200:
-                    raise AssertionError("429 response should be retried before status validation")
+        class RateLimited(Exception):
+            code = 429
+            headers = {"Retry-After": "0"}
 
         class RetryClient:
             def __init__(self):
                 self.calls = 0
+                self.models = SimpleNamespace(embed_content=self.embed_content)
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return None
-
-            def post(self, *_args, **_kwargs):
+            def embed_content(self, **_kwargs):
                 self.calls += 1
-                return FakeResponse(429 if self.calls == 1 else 200)
+                if self.calls == 1:
+                    raise RateLimited("HTTP 429")
+                return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0] + [0.0] * 767)])
+
+            def close(self):
+                pass
 
         retry_client = RetryClient()
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}, clear=True), patch.object(
-            rag_service.httpx, "Client", return_value=retry_client
+            rag_service, "_get_embedding_api_key", return_value="test-key"
+        ), patch.dict(
+            sys.modules, self._sdk_modules(retry_client)
         ), patch.object(rag_service.time, "sleep") as retry_sleep:
             vector = rag_service.create_embedding("retry question")
         self.assertEqual(retry_client.calls, 2)
@@ -164,37 +218,20 @@ class RAGOptimizationTests(unittest.TestCase):
         rag_service._embedding_rate_events.clear()
 
     def test_embedding_batches_are_bounded_and_timeout_is_configured(self):
-        class FakeResponse:
-            status_code = 200
-            headers = {}
-
-            def __init__(self, count):
-                self.count = count
-
-            def json(self):
-                return {"embeddings": [
-                    {"values": [1.0] + [0.0] * 767}
-                    for _ in range(self.count)
-                ]}
-
-            @staticmethod
-            def raise_for_status():
-                return None
-
         class FakeClient:
             def __init__(self):
                 self.batch_sizes = []
-                self.timeout = None
+                self.models = SimpleNamespace(embed_content=self.embed_content)
 
-            def __enter__(self):
-                return self
+            def embed_content(self, **kwargs):
+                self.batch_sizes.append(len(kwargs["contents"]))
+                return SimpleNamespace(embeddings=[
+                    SimpleNamespace(values=[1.0] + [0.0] * 767)
+                    for _ in kwargs["contents"]
+                ])
 
-            def __exit__(self, *_args):
-                return None
-
-            def post(self, _url, headers, json):
-                self.batch_sizes.append(len(json["requests"]))
-                return FakeResponse(len(json["requests"]))
+            def close(self):
+                pass
 
         client = FakeClient()
         rag_service._embedding_rate_events.clear()
@@ -202,12 +239,10 @@ class RAGOptimizationTests(unittest.TestCase):
             "GEMINI_API_KEY": "test-key",
             "GEMINI_EMBEDDING_BATCH_SIZE": "2",
             "GEMINI_EMBEDDING_TIMEOUT_SECONDS": "7",
-        }, clear=True), patch.object(
-            rag_service.httpx, "Client", side_effect=lambda timeout: setattr(client, "timeout", timeout) or client
-        ):
+        }, clear=True), patch.dict(sys.modules, self._sdk_modules(client)):
             vectors = rag_service.generate_embeddings(["a", "b", "c", "d", "e"])
         self.assertEqual(client.batch_sizes, [2, 2, 1])
-        self.assertEqual(client.timeout, 7.0)
+        self.assertEqual(client.client_options["http_options"].timeout, 7000)
         self.assertEqual(vectors.shape, (5, 768))
         rag_service._embedding_rate_events.clear()
 
