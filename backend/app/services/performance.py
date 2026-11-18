@@ -22,6 +22,8 @@ class RequestPerformance:
         self.database_operations = 0
         self.database_statement_counts: dict[str, int] = {}
         self.database_statement_max_ms: dict[str, float] = {}
+        self.database_pipeline_batches = 0
+        self.database_pipeline_statements = 0
         self._lock = threading.Lock()
 
     def add(self, name: str, elapsed_ms: float) -> None:
@@ -39,6 +41,11 @@ class RequestPerformance:
                     elapsed_ms,
                 )
 
+    def add_pipeline(self, statement_count: int) -> None:
+        with self._lock:
+            self.database_pipeline_batches += 1
+            self.database_pipeline_statements += statement_count
+
 
 @contextmanager
 def measure_stage(name: str):
@@ -55,6 +62,12 @@ def record_stage(name: str, elapsed_ms: float) -> None:
     trace = _current_trace.get()
     if trace is not None:
         trace.add(name, elapsed_ms)
+
+
+def record_pipeline(statement_count: int) -> None:
+    trace = _current_trace.get()
+    if trace is not None:
+        trace.add_pipeline(statement_count)
 
 
 class PerformanceLoggingMiddleware:
@@ -86,12 +99,15 @@ class PerformanceLoggingMiddleware:
             }
             logger.info(
                 "request_timing method=%s path=%s total_ms=%.1f "
-                "database_operations=%d database_statement_metrics=%s stages_ms=%s",
+                "database_operations=%d database_statement_metrics=%s "
+                "database_pipeline_batches=%d database_pipeline_statements=%d stages_ms=%s",
                 trace.method,
                 trace.path,
                 total_ms,
                 trace.database_operations,
                 statement_metrics,
+                trace.database_pipeline_batches,
+                trace.database_pipeline_statements,
                 {key: round(value, 1) for key, value in trace.stages_ms.items()},
             )
             _current_trace.reset(token)

@@ -6,7 +6,12 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
-from app.services.db_connection import DB_PATH, current_provider, get_connection
+from app.services.db_connection import (
+    DB_PATH,
+    current_provider,
+    execute_transaction_batch,
+    get_connection,
+)
 from app.services.performance import measure_stage
 
 
@@ -272,8 +277,7 @@ def init_db():
 
 def execute(query: str, params: tuple = ()) -> int:
     with get_db() as conn:
-        cursor = conn.execute(query, params)
-        return cursor.rowcount
+        return execute_transaction_batch(conn, [(query, params)])[0]
 
 
 def fetch_one(query: str, params: tuple = ()):
@@ -291,10 +295,11 @@ def fetch_all(query: str, params: tuple = ()):
 # Conversations
 
 def create_conversation(conversation_id: str, title: str = "New Chat", owner_id: str | None = None):
-    execute(
-        "INSERT INTO conversations (id, title, owner_id) VALUES (?, ?, ?)",
-        (conversation_id, title, owner_id),
-    )
+    with get_db() as conn:
+        execute_transaction_batch(conn, [(
+            "INSERT INTO conversations (id, title, owner_id) VALUES (?, ?, ?)",
+            (conversation_id, title, owner_id),
+        )])
 
 
 def get_conversation(conversation_id: str):
@@ -348,24 +353,25 @@ def clear_conversation(conversation_id: str):
 def claim_unowned_data(owner_id: str) -> tuple[int, int]:
     """Assign legacy ownerless conversations and documents atomically."""
     with get_db() as conn:
-        conversations = conn.execute(
-            "UPDATE conversations SET owner_id = ? WHERE owner_id IS NULL",
-            (owner_id,),
-        ).rowcount
-        documents = conn.execute(
-            "UPDATE documents SET owner_id = ? WHERE owner_id IS NULL",
-            (owner_id,),
-        ).rowcount
-        # Existing document/chat relationships can now be safely backfilled.
-        conn.execute("""
+        results = execute_transaction_batch(conn, [
+            (
+                "UPDATE conversations SET owner_id = ? WHERE owner_id IS NULL",
+                (owner_id,),
+            ),
+            (
+                "UPDATE documents SET owner_id = ? WHERE owner_id IS NULL",
+                (owner_id,),
+            ),
+            ("""
             INSERT OR IGNORE INTO conversation_documents
                 (conversation_id, document_id, owner_id)
             SELECT d.conversation_id, d.id, d.owner_id
             FROM documents d JOIN conversations c
               ON c.id = d.conversation_id AND c.owner_id = d.owner_id
             WHERE d.conversation_id IS NOT NULL AND d.owner_id = ?
-        """, (owner_id,))
-        return conversations, documents
+            """, (owner_id,)),
+        ], commit=False)
+        return results[0], results[1]
 
 
 # Documents
@@ -380,35 +386,34 @@ def create_document(
     owner_id: str | None = None,
     content_hash: str | None = None,
 ):
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO documents (
-                id, conversation_id, owner_id, content_hash, filename,
-                file_type, file_size, file_path
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            document_id, conversation_id, owner_id, content_hash, filename,
-            file_type, file_size, file_path,
-        ))
-
-        if conversation_id and owner_id:
-            valid_row = conn.execute("""
-                SELECT d.id FROM documents d
+    statements = [(
+        """INSERT INTO documents (
+            id, conversation_id, owner_id, content_hash, filename,
+            file_type, file_size, file_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (document_id, conversation_id, owner_id, content_hash, filename,
+         file_type, file_size, file_path),
+    )]
+    if conversation_id and owner_id:
+        # Ownership is enforced in each write itself; no validation SELECT is
+        # needed between the document insert and conversation association.
+        statements.extend([
+            ("""INSERT OR IGNORE INTO conversation_documents
+                (conversation_id, document_id, owner_id)
+                SELECT ?, d.id, ? FROM documents d
                 JOIN conversations c ON c.id = ? AND c.owner_id = ?
-                WHERE d.id = ? AND d.owner_id = ?
-            """, (conversation_id, owner_id, document_id, owner_id)).fetchone()
-            if valid_row:
-                conn.execute("""
-                    INSERT OR IGNORE INTO conversation_documents
-                        (conversation_id, document_id, owner_id)
-                    VALUES (?, ?, ?)
-                """, (conversation_id, document_id, owner_id))
-                conn.execute("""
-                    UPDATE documents
-                    SET conversation_id = COALESCE(conversation_id, ?)
-                    WHERE id = ? AND owner_id = ?
-                """, (conversation_id, document_id, owner_id))
+                WHERE d.id = ? AND d.owner_id = ?""",
+             (conversation_id, owner_id, conversation_id, owner_id,
+              document_id, owner_id)),
+            ("""UPDATE documents
+                SET conversation_id = COALESCE(conversation_id, ?)
+                WHERE id = ? AND owner_id = ?
+                  AND EXISTS (SELECT 1 FROM conversations
+                              WHERE id = ? AND owner_id = ?)""",
+             (conversation_id, document_id, owner_id, conversation_id, owner_id)),
+        ])
+    with get_db() as conn:
+        execute_transaction_batch(conn, statements)
 
     _invalidate_document_cache(owner_id, document_id)
 
@@ -476,6 +481,29 @@ def get_documents_for_owner(document_ids: list[str], owner_id: str) -> list[dict
             _cache_write(_document_cache, (owner_id, document["id"]), document)
 
     return [dict(found[document_id]) for document_id in unique_ids if document_id in found]
+
+
+def get_chat_documents_for_owner(
+    document_ids: list[str], conversation_id: str, owner_id: str
+) -> tuple[bool, list[dict]]:
+    """Validate a chat's conversation and selected documents in one query."""
+    unique_ids = list(dict.fromkeys(document_ids))
+    if not unique_ids:
+        return False, []
+    placeholders = ",".join("?" for _ in unique_ids)
+    rows = fetch_all(f"""
+        SELECT c.id AS _conversation_id, d.*
+        FROM conversations c
+        LEFT JOIN documents d
+          ON d.owner_id = c.owner_id AND d.id IN ({placeholders})
+        WHERE c.id = ? AND c.owner_id = ?
+    """, (*unique_ids, conversation_id, owner_id))
+    if not rows:
+        return False, []
+    documents = [row for row in rows if row.get("id") is not None]
+    for row in documents:
+        row.pop("_conversation_id", None)
+    return True, documents
 
 
 def get_document_for_owner(document_id: str, owner_id: str):
@@ -560,7 +588,7 @@ def attach_document_to_conversation(document_id: str, conversation_id: str, owne
 def attach_documents_to_conversation(
     document_ids: list[str], conversation_id: str, owner_id: str
 ) -> set[str]:
-    """Validate and attach multiple owned documents in bounded SQL calls."""
+    """Validate and attach owned documents with one conditional transaction."""
     unique_ids = list(dict.fromkeys(document_ids))
     if not unique_ids:
         return set()
@@ -570,27 +598,26 @@ def attach_documents_to_conversation(
         batch_ids = unique_ids[start:start + 250]
         placeholders = ",".join("?" for _ in batch_ids)
         with get_db() as conn:
-            valid_rows = conn.execute(f"""
-                SELECT d.id FROM documents d
-                JOIN conversations c ON c.id = ? AND c.owner_id = ?
-                WHERE d.owner_id = ? AND d.id IN ({placeholders})
-            """, (conversation_id, owner_id, owner_id, *batch_ids)).fetchall()
-            valid_ids = {row[0] for row in valid_rows}
-            if not valid_ids:
-                continue
-            ordered_valid_ids = [item for item in batch_ids if item in valid_ids]
-            conn.execute(f"""
-                INSERT OR IGNORE INTO conversation_documents
+            results = execute_transaction_batch(conn, [
+                (f"""INSERT OR IGNORE INTO conversation_documents
                     (conversation_id, document_id, owner_id)
-                VALUES {','.join('(?, ?, ?)' for _ in ordered_valid_ids)}
-            """, tuple(value for document_id in ordered_valid_ids
-                       for value in (conversation_id, document_id, owner_id)))
-            valid_placeholders = ",".join("?" for _ in ordered_valid_ids)
-            conn.execute(f"""
-                UPDATE documents SET conversation_id = COALESCE(conversation_id, ?)
-                WHERE id IN ({valid_placeholders}) AND owner_id = ?
-            """, (conversation_id, *ordered_valid_ids, owner_id))
-            attached_ids.update(valid_ids)
+                    SELECT ?, d.id, ? FROM documents d
+                    JOIN conversations c ON c.id = ? AND c.owner_id = ?
+                    WHERE d.owner_id = ? AND d.id IN ({placeholders})""",
+                 (conversation_id, owner_id, conversation_id, owner_id,
+                  owner_id, *batch_ids)),
+                (f"""UPDATE documents SET conversation_id = COALESCE(conversation_id, ?)
+                    WHERE id IN ({placeholders}) AND owner_id = ?
+                      AND EXISTS (SELECT 1 FROM conversations
+                                  WHERE id = ? AND owner_id = ?)""",
+                 (conversation_id, *batch_ids, owner_id,
+                  conversation_id, owner_id)),
+                (f"""SELECT d.id FROM documents d
+                    JOIN conversations c ON c.id = ? AND c.owner_id = ?
+                    WHERE d.owner_id = ? AND d.id IN ({placeholders})""",
+                 (conversation_id, owner_id, owner_id, *batch_ids), True),
+            ])
+            attached_ids.update(row[0] for row in results[-1]["rows"])
     _invalidate_document_cache(owner_id)
     return attached_ids
 
@@ -641,9 +668,8 @@ def add_chunks(
 
     A single transaction is used for the whole document. When supplied,
     document_status marks the upload processed atomically with its chunks.
-    Multi-value INSERTs are intentional: the Turso DB-API executemany
-    implementation sends one request per row, while each execute here sends
-    at most 50 rows at once.
+    Multi-value INSERTs are bounded at 50 rows, then parameterized batch steps
+    send the document writes through one Turso pipeline transaction.
     """
     if len(chunks) != len(embeddings):
         raise ValueError("Chunk and embedding counts must match.")
@@ -653,6 +679,7 @@ def add_chunks(
     batch_size = 50
     row_sql = "(?, ?, ?, ?, ?, ?, ?)"
     with get_db() as conn:
+        statements = []
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start:start + batch_size]
             batch_embeddings = embeddings[start:start + batch_size]
@@ -664,21 +691,24 @@ def add_chunks(
                     chunk["content"], chunk.get("page_number"), embedding,
                     EMBEDDING_MODEL,
                 ))
-            conn.execute(f"""
+            statements.append((f"""
                 INSERT INTO chunks (
                     id, document_id, chunk_index, content, page_number, embedding,
                     embedding_model
                 ) VALUES {values}
-            """, tuple(params))
+            """, tuple(params)))
         if document_status is not None:
             total_pages, total_chunks = document_status
-            updated = conn.execute("""
+            statements.append(("""
                 UPDATE documents
                 SET status = 'processed', total_pages = ?, total_chunks = ?
                 WHERE id = ?
-            """, (total_pages, total_chunks, document_id))
-            if updated.rowcount != 1:
-                raise ValueError("Document record was not available to mark as processed.")
+            """, (total_pages, total_chunks, document_id)))
+        rowcounts = execute_transaction_batch(conn, statements, commit=False)
+        if document_status is not None and rowcounts[-1] != 1:
+            # The outer DB context rolls the transaction back, including all
+            # chunk writes, if the document row disappeared concurrently.
+            raise ValueError("Document record was not available to mark as processed.")
     if document_status is not None:
         _invalidate_document_cache(document_id=document_id)
 
@@ -738,14 +768,14 @@ def update_chunk_embeddings(updates: list[tuple[str, bytes]]) -> int:
     if not updates:
         return 0
     with get_db() as conn:
-        changed = 0
-        for chunk_id, embedding in updates:
-            changed += conn.execute("""
-                UPDATE chunks
+        results = execute_transaction_batch(conn, [
+            ("""UPDATE chunks
                 SET embedding = ?, embedding_model = ?
-                WHERE id = ?
-            """, (embedding, EMBEDDING_MODEL, chunk_id)).rowcount
-        return changed
+                WHERE id = ?""",
+             (embedding, EMBEDDING_MODEL, chunk_id))
+            for chunk_id, embedding in updates
+        ])
+        return sum(results)
 
 
 def get_document_chunks(document_id: str):
@@ -781,7 +811,8 @@ def add_message(
     sources: list[dict] | None = None,
 ):
     with get_db() as conn:
-        conn.execute("""
+        execute_transaction_batch(conn, [
+            ("""
             INSERT INTO messages (
                 id, conversation_id, role, content, sources
             )
@@ -792,13 +823,13 @@ def add_message(
             role,
             content,
             json.dumps(sources or []),
-        ))
-
-        conn.execute("""
+            )),
+            ("""
             UPDATE conversations
             SET updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-        """, (conversation_id,))
+            """, (conversation_id,)),
+        ])
 
 
 def get_messages(conversation_id: str):

@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from app.services.performance import measure_stage
+from app.services.performance import measure_stage, record_pipeline
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env", override=False)
@@ -116,6 +116,112 @@ def _create_connection():
         connection.close()
         raise
     return connection
+
+
+def execute_transaction_batch(connection, statements, *, commit: bool = True):
+    """Run bound SQL statements in one Turso pipeline transaction.
+
+    The installed Turso client exposes its Hrana pipeline on the session and
+    the matching parameter encoder in ``turso_serverless.protocol``. The
+    normal DB-API methods remain the fallback for SQLite. Pipeline steps are
+    conditional so a failed statement skips later writes and rolls back.
+
+    With ``commit=False``, a successful transaction remains open for the
+    caller to validate row counts before the surrounding get_connection
+    context commits it.
+    """
+    statements = list(statements)
+    if not statements:
+        return []
+
+    driver_connection = connection
+    while hasattr(driver_connection, "_connection"):
+        driver_connection = driver_connection._connection
+
+    session = getattr(driver_connection, "_session", None)
+    normalized_statements = [
+        (statement[0], statement[1], bool(statement[2]) if len(statement) > 2 else False)
+        for statement in statements
+    ]
+    if session is None:
+        output = []
+        for sql, params, want_rows in normalized_statements:
+            cursor = connection.execute(sql, params)
+            if want_rows:
+                output.append({"rowcount": cursor.rowcount, "rows": cursor.fetchall()})
+            else:
+                output.append(getattr(cursor, "rowcount", 0))
+        return output
+
+    from turso_serverless.protocol import build_batch_step, decode_value
+
+    steps = [build_batch_step("BEGIN", want_rows=False)]
+    for index, (sql, params, want_rows) in enumerate(normalized_statements, start=1):
+        steps.append(build_batch_step(
+            sql,
+            args=list(params),
+            want_rows=want_rows,
+            condition={"type": "ok", "step": index - 1},
+        ))
+
+    last_statement_step = len(statements)
+    if commit:
+        commit_step = len(steps)
+        steps.append(build_batch_step(
+            "COMMIT",
+            want_rows=False,
+            condition={"type": "ok", "step": last_statement_step},
+        ))
+        rollback_condition = {"type": "not", "cond": {"type": "ok", "step": commit_step}}
+    else:
+        rollback_condition = {
+            "type": "not",
+            "cond": {"type": "ok", "step": last_statement_step},
+        }
+    steps.append(build_batch_step(
+        "ROLLBACK", want_rows=False, condition=rollback_condition
+    ))
+
+    with measure_stage("database_pipeline"):
+        record_pipeline(len(statements))
+        results = session.execute_pipeline([
+            {"type": "batch", "batch": {"steps": steps}}
+        ])
+
+    if len(results) != 1:
+        raise RuntimeError("Turso pipeline returned an unexpected result count.")
+    pipeline_result = results[0]
+    if pipeline_result.get("type") == "error":
+        error = pipeline_result.get("error") or {}
+        raise RuntimeError(error.get("message", "Turso pipeline failed."))
+
+    response = pipeline_result.get("response") or {}
+    if response.get("type") != "batch":
+        raise RuntimeError("Turso pipeline did not return a batch result.")
+    batch_result = response.get("result") or {}
+    step_results = batch_result.get("step_results") or []
+    step_errors = batch_result.get("step_errors") or []
+    if len(step_results) != len(steps) or len(step_errors) != len(steps):
+        raise RuntimeError("Turso pipeline returned incomplete batch results.")
+
+    errors = [error for error in step_errors if error]
+    if errors:
+        raise RuntimeError(errors[0].get("message", "Turso batch statement failed."))
+
+    output = []
+    for index, (_sql, _params, want_rows) in enumerate(normalized_statements, start=1):
+        result = step_results[index] or {}
+        if want_rows:
+            output.append({
+                "rowcount": result.get("affected_row_count", 0),
+                "rows": [
+                    tuple(decode_value(value) for value in row)
+                    for row in result.get("rows", [])
+                ],
+            })
+        else:
+            output.append(result.get("affected_row_count", 0))
+    return output
 
 
 class _RequestConnection:

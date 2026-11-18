@@ -77,15 +77,17 @@ def _prepare_chat(request: ChatRequest, user: dict) -> Tuple[str, List[str]]:
 
     conversation_id = request.conversation_id
     if conversation_id:
-        conversation = database.get_conversation(conversation_id)
-
-        if not conversation or conversation.get("owner_id") != user["id"]:
+        conversation_exists, documents = database.get_chat_documents_for_owner(
+            document_ids, conversation_id, user["id"]
+        )
+        if not conversation_exists:
             raise HTTPException(
                 status_code=404,
                 detail="Conversation not found.",
             )
-    # Validate every selected document.
-    documents = database.get_documents_for_owner(document_ids, user["id"])
+    else:
+        # Validate every selected document for a new conversation.
+        documents = database.get_documents_for_owner(document_ids, user["id"])
     documents_by_id = {document["id"]: document for document in documents}
     for document_id in document_ids:
         document = documents_by_id.get(document_id)
