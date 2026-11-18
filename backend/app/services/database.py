@@ -10,6 +10,11 @@ from app.services.db_connection import DB_PATH, current_provider, get_connection
 from app.services.performance import measure_stage
 
 
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSION = 768
+EMBEDDING_BYTES = EMBEDDING_DIMENSION * 4
+
+
 def get_db():
     """Compatibility alias for the database connection context manager."""
     @contextmanager
@@ -121,6 +126,7 @@ def init_db():
             content TEXT NOT NULL,
             page_number INTEGER,
             embedding BLOB,
+            embedding_model TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (document_id)
                 REFERENCES documents(id) ON DELETE CASCADE
@@ -188,6 +194,16 @@ def init_db():
                 r"\bcontent_hash\b", definition, re.IGNORECASE
             ):
                 conn.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT")
+
+        # Tag each vector with its embedding space. Existing vectors receive
+        # NULL and retrieval ignores them until the resumable job replaces
+        # them. Keep the old BLOBs intact so migration never destroys data.
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks'"
+        )
+        chunk_definition = (cursor.fetchone()[0] or "")
+        if not re.search(r"\bembedding_model\b", chunk_definition, re.IGNORECASE):
+            conn.execute("ALTER TABLE chunks ADD COLUMN embedding_model TEXT")
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_id, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_id, created_at)")
@@ -545,16 +561,17 @@ def add_chunk(
     content: str,
     page_number: int | None = None,
     embedding: bytes | None = None,
+    embedding_model: str | None = None,
 ):
     execute("""
         INSERT INTO chunks (
             id, document_id, chunk_index,
-            content, page_number, embedding
+            content, page_number, embedding, embedding_model
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         chunk_id, document_id, chunk_index,
-        content, page_number, embedding,
+        content, page_number, embedding, embedding_model,
     ))
 
 
@@ -571,7 +588,7 @@ def add_chunks(document_id: str, chunks: list[dict], embeddings: list[bytes]) ->
         return
 
     batch_size = 50
-    row_sql = "(?, ?, ?, ?, ?, ?)"
+    row_sql = "(?, ?, ?, ?, ?, ?, ?)"
     with get_db() as conn:
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start:start + batch_size]
@@ -582,12 +599,79 @@ def add_chunks(document_id: str, chunks: list[dict], embeddings: list[bytes]) ->
                 params.extend((
                     chunk["chunk_id"], document_id, chunk["chunk_index"],
                     chunk["content"], chunk.get("page_number"), embedding,
+                    EMBEDDING_MODEL,
                 ))
             conn.execute(f"""
                 INSERT INTO chunks (
-                    id, document_id, chunk_index, content, page_number, embedding
+                    id, document_id, chunk_index, content, page_number, embedding,
+                    embedding_model
                 ) VALUES {values}
             """, tuple(params))
+
+
+def get_embedding_migration_counts() -> dict[str, int]:
+    """Count pending vectors without changing the schema or stored data."""
+    with get_db() as conn:
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks'"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return {"total": 0, "ready": 0, "pending": 0}
+
+        cursor = conn.execute("SELECT COUNT(*) FROM chunks")
+        total = int(cursor.fetchone()[0])
+        definition = (row[0] or "")
+        if not re.search(r"\bembedding_model\b", definition, re.IGNORECASE):
+            return {"total": total, "ready": 0, "pending": total}
+
+        cursor = conn.execute("""
+            SELECT COUNT(*) FROM chunks
+            WHERE embedding_model IS NULL
+               OR embedding_model != ?
+               OR embedding IS NULL
+               OR length(embedding) != ?
+        """, (EMBEDDING_MODEL, EMBEDDING_BYTES))
+        pending = int(cursor.fetchone()[0])
+        return {"total": total, "ready": total - pending, "pending": pending}
+
+
+def get_max_chunk_rowid() -> int:
+    """Return a high-water mark so a migration run has a finite work set."""
+    row = fetch_one("SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM chunks")
+    return int(row["max_rowid"] or 0)
+
+
+def get_chunks_needing_embeddings(
+    limit: int = 64,
+    after_rowid: int = 0,
+    through_rowid: int | None = None,
+) -> list[dict]:
+    """Read a bounded, stable window of chunks needing active-model vectors."""
+    upper_bound = through_rowid if through_rowid is not None else 9223372036854775807
+    return fetch_all("""
+        SELECT rowid AS _rowid, id, content FROM chunks
+        WHERE rowid > ? AND rowid <= ?
+          AND (embedding_model IS NULL OR embedding_model != ?
+               OR embedding IS NULL OR length(embedding) != ?)
+        ORDER BY rowid
+        LIMIT ?
+    """, (after_rowid, upper_bound, EMBEDDING_MODEL, EMBEDDING_BYTES, limit))
+
+
+def update_chunk_embeddings(updates: list[tuple[str, bytes]]) -> int:
+    """Store one completed Gemini batch with the matching model tag."""
+    if not updates:
+        return 0
+    with get_db() as conn:
+        changed = 0
+        for chunk_id, embedding in updates:
+            changed += conn.execute("""
+                UPDATE chunks
+                SET embedding = ?, embedding_model = ?
+                WHERE id = ?
+            """, (embedding, EMBEDDING_MODEL, chunk_id)).rowcount
+        return changed
 
 
 def get_document_chunks(document_id: str):

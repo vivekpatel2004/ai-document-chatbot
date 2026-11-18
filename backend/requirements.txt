@@ -18,7 +18,6 @@ requests>=2.31.0
 
 # AI / Machine Learning
 numpy>=1.26.0
-sentence-transformers>=2.7.0
 
 # Document Processing
 pymupdf>=1.24.0

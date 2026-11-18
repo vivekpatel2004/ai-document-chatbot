@@ -3,25 +3,38 @@ import logging
 import re
 import threading
 import hashlib
+import os
+import time
+from collections import deque
+from email.utils import parsedate_to_datetime
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import httpx
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from app.services.performance import measure_stage
 
 
 logger = logging.getLogger(__name__)
 
-# Keep this model unchanged so newly stored embeddings and existing
-# embeddings use the same vector space.
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIMENSION = 768
+EMBEDDING_BATCH_SIZE = 64  # Gemini batch requests support up to 100 inputs.
+EMBEDDING_TIMEOUT_SECONDS = 30.0
+EMBEDDING_MAX_RETRIES = 4
+EMBEDDING_REQUESTS_PER_MINUTE = 60
+GEMINI_EMBEDDING_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{DEFAULT_EMBEDDING_MODEL}:batchEmbedContents"
+)
 
 DEFAULT_TOP_K = 5
 DEFAULT_SCORE_THRESHOLD = 0.05
 
-_embedding_model: Optional[SentenceTransformer] = None
-_embedding_model_lock = threading.Lock()
+_embedding_request_gate = threading.BoundedSemaphore(2)
+_embedding_rate_lock = threading.Lock()
+_embedding_rate_events: deque[tuple[float, int]] = deque()
 _fallback_embedding_lock = threading.RLock()
 _fallback_embedding_cache: OrderedDict[tuple[str, str, str], np.ndarray] = OrderedDict()
 _FALLBACK_EMBEDDING_CACHE_SIZE = 2048
@@ -31,33 +44,122 @@ _FALLBACK_EMBEDDING_CACHE_SIZE = 2048
 # Embedding model
 # ---------------------------------------------------------------------
 
-def get_embedding_model() -> SentenceTransformer:
-    """
-    Load the embedding model once and reuse it.
+def _get_embedding_api_key() -> str:
+    # Match the existing chat service's precedence so both features select the
+    # same key when both aliases happen to be configured.
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing Gemini API key. Set GEMINI_API_KEY or GOOGLE_API_KEY."
+        )
+    return api_key
 
-    The model is loaded lazily, when an embedding is first required.
-    """
-    global _embedding_model
 
-    if _embedding_model is None:
-        with _embedding_model_lock:
-            if _embedding_model is None:
-                logger.info(
-                    "Loading embedding model: %s",
-                    DEFAULT_EMBEDDING_MODEL,
-                )
-                _embedding_model = SentenceTransformer(
-                    DEFAULT_EMBEDDING_MODEL
-                )
+def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), 30.0)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    return min(max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0), 30.0)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return min(0.5 * (2 ** attempt), 8.0)
 
-    return _embedding_model
+
+def _wait_for_rate_capacity(request_count: int) -> None:
+    """Pace individual embeddings, since a batch contains multiple requests."""
+    limit = int(os.getenv(
+        "GEMINI_EMBEDDING_REQUESTS_PER_MINUTE",
+        EMBEDDING_REQUESTS_PER_MINUTE,
+    ))
+    if limit <= 0 or request_count > limit:
+        raise ValueError(
+            "GEMINI_EMBEDDING_REQUESTS_PER_MINUTE must be positive and "
+            "at least as large as the current batch."
+        )
+
+    while True:
+        wait_seconds = 0.0
+        with _embedding_rate_lock:
+            now = time.monotonic()
+            while _embedding_rate_events and _embedding_rate_events[0][0] <= now - 60.0:
+                _embedding_rate_events.popleft()
+            used = sum(weight for _, weight in _embedding_rate_events)
+            if used + request_count <= limit:
+                _embedding_rate_events.append((now, request_count))
+                return
+            wait_seconds = max(
+                0.01,
+                _embedding_rate_events[0][0] + 60.0 - now,
+            )
+        time.sleep(wait_seconds)
+
+
+def _request_embedding_batch(
+    texts: Sequence[str], task_type: str, client: httpx.Client,
+) -> list[list[float]]:
+    api_key = _get_embedding_api_key()
+    payload = {
+        "requests": [
+            {
+                "model": f"models/{DEFAULT_EMBEDDING_MODEL}",
+                "content": {"parts": [{"text": text}]},
+                "embedContentConfig": {
+                    "taskType": task_type,
+                    "outputDimensionality": EMBEDDING_DIMENSION,
+                },
+            }
+            for text in texts
+        ]
+    }
+    headers = {"x-goog-api-key": api_key}
+    response = None
+    for attempt in range(EMBEDDING_MAX_RETRIES + 1):
+        try:
+            _wait_for_rate_capacity(len(texts))
+            with _embedding_request_gate:
+                response = client.post(GEMINI_EMBEDDING_URL, headers=headers, json=payload)
+            if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                if attempt < EMBEDDING_MAX_RETRIES:
+                    delay = _retry_delay(response, attempt)
+                    logger.warning("Gemini embeddings returned HTTP %s; retrying in %.1fs.", response.status_code, delay)
+                    time.sleep(delay)
+                    continue
+            response.raise_for_status()
+            data = response.json()
+            results = data.get("embeddings")
+            if not isinstance(results, list) or len(results) != len(texts):
+                raise ValueError("Gemini returned an unexpected number of embeddings.")
+            vectors = []
+            for item in results:
+                values = item.get("values") if isinstance(item, dict) else None
+                if not isinstance(values, list) or len(values) != EMBEDDING_DIMENSION:
+                    raise ValueError(f"Gemini embedding must have {EMBEDDING_DIMENSION} dimensions.")
+                vectors.append(values)
+            return vectors
+        except httpx.RequestError:
+            if attempt >= EMBEDDING_MAX_RETRIES:
+                raise
+            delay = _retry_delay(None, attempt)
+            logger.warning("Gemini embedding request failed; retrying in %.1fs.", delay)
+            time.sleep(delay)
+    if response is not None:
+        response.raise_for_status()
+    raise RuntimeError("Gemini embedding request failed after retries.")
 
 
 def generate_embeddings(
     texts: Sequence[str],
+    task_type: str = "RETRIEVAL_DOCUMENT",
 ) -> np.ndarray:
     """
-    Generate normalized float32 embeddings for a sequence of texts.
+    Generate normalized float32 Gemini embeddings for a sequence of texts.
     """
     cleaned_texts = [
         str(text).strip()
@@ -68,29 +170,39 @@ def generate_embeddings(
     if not cleaned_texts:
         return np.empty((0, 0), dtype=np.float32)
 
-    model = get_embedding_model()
+    if task_type not in {"RETRIEVAL_DOCUMENT", "RETRIEVAL_QUERY"}:
+        raise ValueError("Unsupported Gemini retrieval embedding task type.")
 
-    embeddings = model.encode(
-        cleaned_texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    timeout = float(os.getenv("GEMINI_EMBEDDING_TIMEOUT_SECONDS", EMBEDDING_TIMEOUT_SECONDS))
+    batch_size = int(os.getenv("GEMINI_EMBEDDING_BATCH_SIZE", EMBEDDING_BATCH_SIZE))
+    requests_per_minute = int(os.getenv(
+        "GEMINI_EMBEDDING_REQUESTS_PER_MINUTE",
+        EMBEDDING_REQUESTS_PER_MINUTE,
+    ))
+    if timeout <= 0 or not 1 <= batch_size <= 100 or requests_per_minute <= 0:
+        raise ValueError(
+            "Gemini embedding timeout and requests-per-minute must be positive; "
+            "batch size must be between 1 and 100."
+        )
+    batch_size = min(batch_size, requests_per_minute)
 
-    embeddings = np.asarray(
-        embeddings,
-        dtype=np.float32,
-    )
+    vectors: list[list[float]] = []
+    with httpx.Client(timeout=timeout) as client:
+        for start in range(0, len(cleaned_texts), batch_size):
+            batch = cleaned_texts[start:start + batch_size]
+            vectors.extend(_request_embedding_batch(batch, task_type, client))
 
-    if embeddings.ndim == 1:
-        embeddings = embeddings.reshape(1, -1)
+    embeddings = np.asarray(vectors, dtype=np.float32)
 
     if not np.all(np.isfinite(embeddings)):
         raise ValueError(
             "Embedding generation returned non-finite values."
         )
 
-    return embeddings
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    if np.any(norms <= 1e-12):
+        raise ValueError("Embedding generation returned a zero-magnitude vector.")
+    return embeddings / norms
 
 
 def create_embedding(text: str) -> np.ndarray:
@@ -100,7 +212,7 @@ def create_embedding(text: str) -> np.ndarray:
     if not text or not text.strip():
         raise ValueError("Cannot create an embedding from empty text.")
 
-    embeddings = generate_embeddings([text])
+    embeddings = generate_embeddings([text], task_type="RETRIEVAL_QUERY")
 
     if embeddings.shape[0] != 1:
         raise ValueError("Failed to generate the text embedding.")
@@ -116,7 +228,7 @@ def _decode_stored_embedding(
     stored_embedding: Any,
 ) -> Optional[np.ndarray]:
     """
-    Convert a SQLite embedding BLOB into a normalized float32 vector.
+    Convert a stored Gemini embedding BLOB into a normalized float32 vector.
 
     Returns None if the stored value is missing or invalid.
     """
@@ -300,9 +412,9 @@ def retrieve_relevant_chunks(
 
     # First, reuse vectors already stored in SQLite.
     for index, chunk in enumerate(valid_chunks):
-        stored_vector = _decode_stored_embedding(
-            chunk.get("embedding")
-        )
+        stored_vector = None
+        if chunk.get("embedding_model") == DEFAULT_EMBEDDING_MODEL:
+            stored_vector = _decode_stored_embedding(chunk.get("embedding"))
 
         # A vector with a different dimension cannot be compared.
         if (

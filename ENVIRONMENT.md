@@ -9,7 +9,7 @@ Copy-Item backend/.env.example backend/.env
 notepad backend/.env
 ```
 
-Set `GOOGLE_API_KEY`, then install/run the backend:
+Set the existing `GEMINI_API_KEY` used for Gemini chat (or its backward-compatible `GOOGLE_API_KEY` alias), then install/run the backend:
 
 ```powershell
 Set-Location backend
@@ -35,7 +35,7 @@ Configure these as backend service secrets, not in the frontend:
 
 ```dotenv
 LLM_PROVIDER=gemini
-GOOGLE_API_KEY=<secret>
+GEMINI_API_KEY=<secret>
 GEMINI_MODEL=gemini-3.8-flash
 DATABASE_PROVIDER=turso
 DATABASE_URL=libsql://<your-turso-host>

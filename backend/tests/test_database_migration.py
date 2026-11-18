@@ -1,6 +1,7 @@
 """Verify auth schema migration preserves an existing SQLite database."""
 import os
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ class ExistingDatabaseMigrationTests(unittest.TestCase):
                     VALUES ('legacy-doc', 'legacy-chat', 'notes.txt', 'txt', 'uploads/notes.txt');
                 INSERT INTO chunks (id, document_id, chunk_index, content)
                     VALUES ('legacy-chunk', 'legacy-doc', 0, 'preserved text');
+                UPDATE chunks SET embedding = X'00000000' WHERE id = 'legacy-chunk';
                 INSERT INTO messages (id, conversation_id, role, content)
                     VALUES ('legacy-message', 'legacy-chat', 'user', 'preserved message');
             """)
@@ -69,12 +71,38 @@ class ExistingDatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT embedding FROM chunks WHERE id='legacy-chunk'").fetchone()[0], b"\x00\x00\x00\x00")
+            self.assertIsNone(conn.execute("SELECT embedding_model FROM chunks WHERE id='legacy-chunk'").fetchone()[0])
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
             self.assertIsNone(conn.execute("SELECT owner_id FROM conversations WHERE id='legacy-chat'").fetchone()[0])
             self.assertIsNone(conn.execute("SELECT owner_id FROM documents WHERE id='legacy-doc'").fetchone()[0])
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertTrue({"users", "sessions"}.issubset(tables))
         conn.close()
+
+    def test_repeated_startup_preserves_tagged_gemini_embedding(self):
+        vector = struct.pack("<f", 1.0) + bytes((768 - 1) * 4)
+        with sqlite3.connect(str(_db_path)) as conn:
+            conn.execute(
+                "UPDATE chunks SET embedding = ?, embedding_model = ? WHERE id = ?",
+                (vector, "gemini-embedding-001", "legacy-chunk"),
+            )
+        conn.close()
+        env = os.environ.copy()
+        env["DB_PATH"] = str(_db_path)
+        worker = "from app.services.database import init_db; init_db()"
+        subprocess.run(
+            [sys.executable, "-c", worker],
+            cwd=Path(__file__).resolve().parents[1], env=env, check=True,
+        )
+        with sqlite3.connect(str(_db_path)) as conn:
+            stored, model = conn.execute(
+                "SELECT embedding, embedding_model FROM chunks WHERE id = ?",
+                ("legacy-chunk",),
+            ).fetchone()
+        conn.close()
+        self.assertEqual(stored, vector)
+        self.assertEqual(model, "gemini-embedding-001")
 
 
 if __name__ == "__main__":

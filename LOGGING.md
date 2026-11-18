@@ -246,7 +246,7 @@ ERROR:    Connection to Gemini API failed
 
 **Warnings:**
 ```
-WARNING:  OpenAI API unavailable, using sentence-transformers
+WARNING:  Gemini embeddings returned HTTP 429; retrying in 1.0s.
 WARNING:  Large document detected, processing may take longer
 ```
 

@@ -1,13 +1,13 @@
 # AI Document Chatbot
 
-A chat-first document assistant built with React, Vite, TypeScript, FastAPI, SQLite/libSQL, Gemini, and Sentence Transformers. Users upload private PDF, DOCX, or TXT files, then ask questions grounded in selected documents. Answers stream into a persistent conversation with page-aware citations.
+A chat-first document assistant built with React, Vite, TypeScript, FastAPI, SQLite/libSQL, and Gemini. Users upload private PDF, DOCX, or TXT files, then ask questions grounded in selected documents. Answers stream into a persistent conversation with page-aware citations.
 
 ## Features
 
 - Email/password signup and login with server-validated ownership for documents, conversations, messages, downloads, and exports.
 - New Chat, Overview, Documents, Chat History, and Settings navigation.
 - Private PDF, DOCX, and TXT uploads. Local disk is the development default; Backblaze B2 or Cloudflare R2 use the existing S3-compatible adapter.
-- Sentence Transformers embeddings stored with document chunks in the database; RAG retrieval scopes context to selected, authenticated-user documents.
+- Gemini `gemini-embedding-001` vectors stored with document chunks; RAG retrieval scopes context to selected, authenticated-user documents.
 - Gemini streaming, citations with filename/page references, persistent chat history, light/dark themes, and TXT/Markdown/PDF export.
 - SQLite for local development and Turso/libSQL for hosted persistence.
 
@@ -25,7 +25,7 @@ Set-Location ..\frontend
 npm ci
 ```
 
-Edit `backend/.env` and set `GOOGLE_API_KEY`. Keep SQLite and local file storage for a simple local run. Start the services in separate terminals:
+Edit `backend/.env` and set the existing `GEMINI_API_KEY` used by Gemini chat (or the supported `GOOGLE_API_KEY` alias). Keep SQLite and local file storage for a simple local run. Start the services in separate terminals:
 
 ```powershell
 # Terminal 1, from backend/

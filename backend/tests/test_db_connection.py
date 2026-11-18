@@ -288,7 +288,7 @@ class DatabaseConnectionTests(unittest.TestCase):
                         database.add_chunks("batch-document", chunks, [b"vector"] * len(chunks))
                     inserts = [query for query in statements if "INSERT INTO chunks" in query]
                     self.assertEqual(len(inserts), 3)
-                    self.assertEqual([query.count("(?, ?, ?, ?, ?, ?)") for query in inserts], [50, 50, 20])
+                    self.assertEqual([query.count("(?, ?, ?, ?, ?, ?, ?)") for query in inserts], [50, 50, 20])
                     self.assertEqual(sum(conn.commits for conn in wrappers), 1)
                     self.assertEqual(len(database.get_document_chunks("batch-document")), 120)
         finally:

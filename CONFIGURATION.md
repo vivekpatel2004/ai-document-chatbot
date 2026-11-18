@@ -19,12 +19,16 @@ The backend reads `backend/.env` first and then the repository-root `.env` as a 
 | Variable | Purpose |
 |---|---|
 | `LLM_PROVIDER` | `gemini` (default) or `openai` |
-| `GOOGLE_API_KEY` | Gemini key; `GEMINI_API_KEY` is also accepted |
+| `GEMINI_API_KEY` | Existing Gemini key used for chat and embeddings; `GOOGLE_API_KEY` remains an accepted alias |
 | `GEMINI_MODEL` | Optional Gemini model override; current default is `gemini-3.8-flash` |
 | `OPENAI_API_KEY` | Required only when selecting OpenAI for chat |
 | `OPENAI_MODEL` | Optional OpenAI model override; current default is `gpt-4o-mini` |
 
-The document embedding model is Sentence Transformers `sentence-transformers/all-MiniLM-L6-v2`; the model loads lazily and is cached. Embeddings are persisted on chunks. `OPENAI_API_KEY` does not select the embedding model.
+Document embeddings use `gemini-embedding-001` with 768 dimensions. Document vectors use `RETRIEVAL_DOCUMENT`, question vectors use `RETRIEVAL_QUERY`, and both are L2-normalized before cosine similarity. The existing Gemini key is reused even when OpenAI is selected for chat. `OPENAI_API_KEY` does not select the embedding model.
+
+On first startup after this upgrade, the database migration adds a model tag column without rewriting or deleting any embedding BLOBs. Untagged/legacy vectors are ignored by retrieval; tagged Gemini vectors are preserved. Chunk text and document data remain unchanged. Run `python -m scripts.reembed_gemini_embeddings --dry-run` to inspect counts without changing schema/data or calling Gemini, then run `python -m scripts.reembed_gemini_embeddings` from `backend/` to regenerate and persist missing vectors. The job reports progress and remaining counts, commits successful batches, and exits nonzero if any vectors remain; rerunning resumes unfinished work. Until it finishes, RAG generates compatible Gemini vectors on demand for missing chunks.
+
+Optional embedding controls: `GEMINI_EMBEDDING_BATCH_SIZE` (1–100, default 64), `GEMINI_EMBEDDING_TIMEOUT_SECONDS` (positive seconds, default 30), and `GEMINI_EMBEDDING_REQUESTS_PER_MINUTE` (default 60). The limiter counts each text in a batch, waits on a rolling per-process window, and retries 429/5xx/network failures with bounded backoff and `Retry-After`. Tune this cap to the project's current Gemini embedding quota. Multiple backend processes/replicas do not share this in-memory limiter, so divide the project quota across them or use a shared limiter at higher scale.
 
 ## Document storage
 

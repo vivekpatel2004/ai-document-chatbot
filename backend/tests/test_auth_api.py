@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 _test_db = Path(tempfile.gettempdir()) / f"document-chat-auth-{os.getpid()}.sqlite3"
 os.environ["DB_PATH"] = str(_test_db)
@@ -237,6 +237,45 @@ class AuthenticationApiTests(unittest.IsolatedAsyncioTestCase):
         after = await self.client.get("/api/conversations/", headers=headers)
         self.assertEqual(after.json()["total"], before.json()["total"])
 
+    async def test_chat_retrieves_tagged_gemini_vectors_and_saves_answer(self):
+        import numpy as np
+
+        account = await self.client.post("/api/auth/signup", json={
+            "name": "RAG User", "email": "rag-chat@example.test",
+            "password": "secure-password-123",
+        })
+        owner_id = account.json()["user"]["id"]
+        headers = {"Authorization": f"Bearer {account.json()['token']}"}
+        document_id = str(uuid.uuid4())
+        database.create_document(
+            document_id=document_id, conversation_id=None, owner_id=owner_id,
+            filename="rag.txt", file_type="txt", file_size=20,
+            file_path="rag.txt",
+        )
+        database.update_document_status(document_id, "processed", 0, 1)
+        vector = np.zeros(768, dtype=np.float32)
+        vector[0] = 1.0
+        database.add_chunk(
+            "rag-chat-chunk", document_id, 0, "The answer is in this passage.",
+            embedding=vector.tobytes(),
+            embedding_model="gemini-embedding-001",
+        )
+        llm = AsyncMock(return_value={"content": "The answer is in this passage."})
+        with patch("app.services.rag_service.create_embedding", return_value=vector), patch(
+            "app.routers.chat._get_llm_service", return_value=llm
+        ):
+            response = await self.client.post("/api/chat/", json={
+                "message": "What is the answer?", "document_ids": [document_id],
+                "stream": False,
+            }, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["message"], "The answer is in this passage.")
+        self.assertEqual(response.json()["sources"][0]["document_id"], document_id)
+        self.assertEqual(
+            database.get_messages(response.json()["conversation_id"])[-1]["content"],
+            response.json()["message"],
+        )
+
     async def test_duplicate_upload_reuses_owned_document(self):
         account = await self.client.post("/api/auth/signup", json={
             "name": "Upload Owner", "email": "upload-owner@example.test", "password": "secure-password-123"
@@ -442,6 +481,14 @@ class AuthenticationApiTests(unittest.IsolatedAsyncioTestCase):
                         document_id = response.json()["documents"][0]["id"]
                         row = database.get_document_for_owner(
                             document_id, account.json()["user"]["id"]
+                        )
+                        stored_chunk = database.get_document_chunks(document_id)[0]
+                        self.assertEqual(
+                            stored_chunk["embedding_model"], "gemini-embedding-001"
+                        )
+                        self.assertEqual(
+                            stored_chunk["embedding"],
+                            np.asarray([1.0, 0.0], dtype=np.float32).tobytes(),
                         )
                         if provider == "r2":
                             self.assertTrue(row["file_path"].startswith("r2:documents/"))
